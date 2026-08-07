@@ -1,10 +1,10 @@
 {
-	"id": "obsidian-view-mode-by-frontmatter",
-	"name": "Force note view mode",
-	"version": "1.2.2",
+	"id": "note-view-rules",
+	"name": "Note View Rules",
+	"version": "1.0.0",
 	"minAppVersion": "0.9.12",
-	"description": "This plugin allows to force the view mode and editing mode for a note by using front matter",
-	"author": "Benny Wydooghe",
-	"authorUrl": "https://i-net.be",
+	"description": "Force reading, live preview, or source mode using frontmatter, folders, filenames, or tags.",
+	"author": "ayydany",
+	"authorUrl": "https://github.com/ayydany",
 	"isDesktopOnly": false
 }

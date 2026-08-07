@@ -8,6 +8,7 @@ import {
   PluginSettingTab,
   Setting,
   debounce,
+  getAllTags,
 } from "obsidian";
 
 interface ViewModeByFrontmatterSettings {
@@ -16,6 +17,7 @@ interface ViewModeByFrontmatterSettings {
   ignoreForceViewAll: boolean;
   folders: {folder: string, viewMode: string}[];
   files: {filePattern: string; viewMode: string}[];
+  tags: {tag: string; viewMode: string}[];
 }
 
 const DEFAULT_SETTINGS: ViewModeByFrontmatterSettings = {
@@ -24,6 +26,7 @@ const DEFAULT_SETTINGS: ViewModeByFrontmatterSettings = {
   ignoreForceViewAll: false,
   folders: [{folder: '', viewMode: ''}],
   files: [{filePattern: '', viewMode: ''}],
+  tags: [{tag: '', viewMode: ''}],
 };
 
 export default class ViewModeByFrontmatterPlugin extends Plugin {
@@ -65,8 +68,9 @@ export default class ViewModeByFrontmatterPlugin extends Plugin {
       }
 
       let state = leaf.getViewState();
+      const fileCache = this.app.metadataCache.getFileCache(view.file);
 
-      // check if in a declared folder or file
+      // check if in a declared folder, file, or tag
       let folderOrFileModeState: {source: boolean, mode: string} | null = null;
 
       const setFolderOrFileModeState = (viewMode: string): void => {
@@ -133,6 +137,25 @@ export default class ViewModeByFrontmatterPlugin extends Plugin {
         setFolderOrFileModeState(viewMode);
       }
 
+      const fileTags = new Set(
+        (getAllTags(fileCache) ?? []).map((tag) => tag.slice(1).toLowerCase())
+      );
+
+      for (const { tag, viewMode } of this.settings.tags) {
+        const normalizedTag = tag.trim().replace(/^#/, "").toLowerCase();
+
+        if (!normalizedTag || !viewMode || !fileTags.has(normalizedTag)) {
+          continue;
+        }
+
+        if (!state.state) {
+          // just to be on the safe side
+          continue;
+        }
+
+        setFolderOrFileModeState(viewMode);
+      }
+
       if (folderOrFileModeState) {
         if (state.state.mode !== folderOrFileModeState.mode || 
           state.state.source !== folderOrFileModeState.source) {
@@ -147,7 +170,6 @@ export default class ViewModeByFrontmatterPlugin extends Plugin {
 
       // ... get frontmatter data and search for a key indicating the desired view mode
       // and when the given key is present ... set it to the declared mode
-      const fileCache = this.app.metadataCache.getFileCache(view.file);
       const fileDeclaredUIMode =
         fileCache !== null && fileCache.frontmatter
           ? fileCache.frontmatter[this.OBSIDIAN_UI_MODE_KEY]
@@ -525,6 +547,88 @@ class ViewModeByFrontmatterSettingTab extends PluginSettingTab {
 
       s.infoEl.remove();
 
+      div.appendChild(containerEl.lastChild as Node);
+    });
+
+    createHeader("Tags");
+
+    const tagsDesc = document.createDocumentFragment();
+    tagsDesc.append(
+      "Specify a view mode for notes with a given tag. Both frontmatter and inline tags are supported, with or without the leading #.",
+      tagsDesc.createEl("br"),
+      "Note that this will force the view mode, even if the note has a different view mode set in its frontmatter.",
+      tagsDesc.createEl("br"),
+      "Precedence is from bottom (highest) to top (lowest).",
+      tagsDesc.createEl("br"),
+      "Tag rules override folder and file rules for the same note."
+    );
+
+    new Setting(this.containerEl).setDesc(tagsDesc);
+
+    new Setting(this.containerEl)
+      .setDesc("Add new tag")
+      .addButton((button) => {
+        button
+          .setTooltip("Add another tag to the list")
+          .setButtonText("+")
+          .setCta()
+          .onClick(async () => {
+            this.plugin.settings.tags.push({
+              tag: "",
+              viewMode: "",
+            });
+            await this.plugin.saveSettings();
+            this.display();
+          });
+      });
+
+    this.plugin.settings.tags.forEach((tagRule, index) => {
+      const div = containerEl.createEl("div");
+      div.addClass("force-view-mode-div");
+      div.addClass("force-view-mode-folder");
+
+      const s = new Setting(this.containerEl)
+        .addSearch((cb) => {
+          cb.setPlaceholder("Example: dashboard")
+            .setValue(tagRule.tag)
+            .onChange(async (value) => {
+              const normalizedTag = value.trim().replace(/^#/, "").toLowerCase();
+              const isDuplicate = this.plugin.settings.tags.some(
+                (rule, ruleIndex) =>
+                  ruleIndex !== index &&
+                  rule.tag.trim().replace(/^#/, "").toLowerCase() === normalizedTag
+              );
+
+              if (normalizedTag && isDuplicate) {
+                console.error("NoteViewRules: Tag rule already exists", value);
+                return;
+              }
+
+              this.plugin.settings.tags[index].tag = value;
+              await this.plugin.saveSettings();
+            });
+        })
+        .addDropdown((cb) => {
+          modes.forEach((mode) => {
+            cb.addOption(mode, mode);
+          });
+
+          cb.setValue(tagRule.viewMode || "default").onChange(async (value) => {
+            this.plugin.settings.tags[index].viewMode = value;
+            await this.plugin.saveSettings();
+          });
+        })
+        .addExtraButton((cb) => {
+          cb.setIcon("cross")
+            .setTooltip("Delete")
+            .onClick(async () => {
+              this.plugin.settings.tags.splice(index, 1);
+              await this.plugin.saveSettings();
+              this.display();
+            });
+        });
+
+      s.infoEl.remove();
       div.appendChild(containerEl.lastChild as Node);
     });
   }
