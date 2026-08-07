@@ -1,531 +1,817 @@
 import {
-  WorkspaceLeaf,
-  Plugin,
-  MarkdownView,
+  AbstractInputSuggest,
   App,
-  TFile,
-  TFolder,
+  CachedMetadata,
+  MarkdownView,
+  Modal,
+  Plugin,
   PluginSettingTab,
   Setting,
-  debounce,
+  TFile,
+  TFolder,
+  WorkspaceLeaf,
+  getAllTags,
 } from "obsidian";
+import {
+  NoteFacts,
+  OPERATORS_BY_SOURCE,
+  RuleOperator,
+  RuleSource,
+  ViewRule,
+  ViewRuleCondition,
+  ViewRuleOutput,
+  resolveViewRule,
+  validateRule,
+} from "./rules";
 
-interface ViewModeByFrontmatterSettings {
+interface NoteViewRulesSettings {
   debounceTimeout: number;
   ignoreOpenFiles: boolean;
-  ignoreForceViewAll: boolean;
-  folders: {folder: string, viewMode: string}[];
-  files: {filePattern: string; viewMode: string}[];
+  rules: ViewRule[];
 }
 
-const DEFAULT_SETTINGS: ViewModeByFrontmatterSettings = {
-  debounceTimeout: 300,
+interface DesiredViewState {
+  mode?: "preview" | "source";
+  source?: boolean;
+}
+
+const DEFAULT_SETTINGS: NoteViewRulesSettings = {
+  debounceTimeout: 0,
   ignoreOpenFiles: false,
-  ignoreForceViewAll: false,
-  folders: [{folder: '', viewMode: ''}],
-  files: [{filePattern: '', viewMode: ''}],
+  rules: [],
 };
 
-export default class ViewModeByFrontmatterPlugin extends Plugin {
-  settings: ViewModeByFrontmatterSettings;
+const SOURCE_LABELS: Record<RuleSource, string> = {
+  tag: "Tag",
+  fileName: "File name",
+  folder: "Folder",
+  path: "Full path",
+};
 
-  OBSIDIAN_UI_MODE_KEY = "obsidianUIMode";
-  OBSIDIAN_EDITING_MODE_KEY = "obsidianEditingMode";
+const OPERATOR_LABELS: Record<RuleOperator, string> = {
+  includes: "includes",
+  notIncludes: "does not include",
+  is: "is",
+  isNot: "is not",
+  contains: "contains",
+  notContains: "does not contain",
+  startsWith: "starts with",
+  endsWith: "ends with",
+  matches: "matches regex",
+  inside: "is inside",
+  notInside: "is not inside",
+};
 
-  openedFiles: String[];
+export default class NoteViewRulesPlugin extends Plugin {
+  settings: NoteViewRulesSettings;
+  openedFiles = new Set<string>();
 
   async onload() {
     await this.loadSettings();
+    this.addSettingTab(new NoteViewRulesSettingTab(this.app, this));
+    this.openedFiles = getOpenNotePaths(this.app);
 
-    this.addSettingTab(new ViewModeByFrontmatterSettingTab(this.app, this));
-
-    this.openedFiles = resetOpenedNotes(this.app);
-
-    const readViewModeFromFrontmatterAndToggle = async (
-      leaf: WorkspaceLeaf
-    ) => {
-      let view = leaf.view instanceof MarkdownView ? leaf.view : null;
-
-      if (null === view) {
-        if (true == this.settings.ignoreOpenFiles) {
-          this.openedFiles = resetOpenedNotes(this.app);
-        }
-
+    const evaluateLeaf = async (leaf: WorkspaceLeaf | null) => {
+      if (!leaf || !(leaf.view instanceof MarkdownView) || !leaf.view.file) {
         return;
       }
 
-      // if setting is true, nothing to do if this was an open note
-      if (
-        true == this.settings.ignoreOpenFiles &&
-        alreadyOpen(view.file, this.openedFiles)
-      ) {
-        this.openedFiles = resetOpenedNotes(this.app);
-
+      const view = leaf.view;
+      if (this.settings.ignoreOpenFiles && this.openedFiles.has(view.file.path)) {
+        this.openedFiles = getOpenNotePaths(this.app);
         return;
       }
 
-      let state = leaf.getViewState();
+      const cache = this.app.metadataCache.getFileCache(view.file);
+      const facts = createNoteFacts(view.file, cache);
+      const resolution = resolveViewRule(this.settings.rules, facts);
+      const desired = resolution
+        ? desiredStateFromOutput(resolution.output)
+        : desiredStateFromFrontmatter(cache);
 
-      // check if in a declared folder or file
-      let folderOrFileModeState: {source: boolean, mode: string} | null = null;
-
-      const setFolderOrFileModeState = (viewMode: string): void => {
-        const [key, mode] = viewMode.split(":").map((s) => s.trim());
-
-        if (key === "default") {
-          folderOrFileModeState = null; // ensures that no state is set
-          return;
-        } else if (!["live", "preview", "source"].includes(mode)) {
-          return;
-        }
-
-        folderOrFileModeState = { ...state.state };
-
-        folderOrFileModeState.mode = mode;
-
-        switch (key) {
-          case this.OBSIDIAN_EDITING_MODE_KEY: {
-            if (mode == "live") {
-              folderOrFileModeState.source = false;
-              folderOrFileModeState.mode = "source";
-            } else {
-              folderOrFileModeState.source = true;
-            }
-            break;
-          }
-          case this.OBSIDIAN_UI_MODE_KEY:
-            folderOrFileModeState.source = false;
-            break;
-        }
-      };
-
-      for (const folderMode of this.settings.folders) {
-        if (folderMode.folder !== '' && folderMode.viewMode) {
-          const folder = this.app.vault.getAbstractFileByPath(folderMode.folder);
-          if (folder instanceof TFolder) {
-            if (view.file.parent === folder || view.file.parent.path.startsWith(folder.path)) {
-              if (!state.state) { // just to be on the safe side
-                continue
-              }
-
-              setFolderOrFileModeState(folderMode.viewMode);
-            }
-          } else {
-            console.warn(`ForceViewMode: Folder ${folderMode.folder} does not exist or is not a folder.`);
-           }
-        }
+      if (desired) {
+        await applyDesiredState(leaf, view, desired);
       }
 
-      for (const { filePattern, viewMode } of this.settings.files) {
-        if (!filePattern || !viewMode) {
-          continue;
-        }
-
-        if (!state.state) {
-          // just to be on the safe side
-          continue;
-        }
-
-        if (!view.file.basename.match(filePattern)) {
-          continue;
-        }
-
-        setFolderOrFileModeState(viewMode);
+      if (this.settings.ignoreOpenFiles) {
+        this.openedFiles = getOpenNotePaths(this.app);
       }
-
-      if (folderOrFileModeState) {
-        if (state.state.mode !== folderOrFileModeState.mode || 
-          state.state.source !== folderOrFileModeState.source) {
-          state.state.mode = folderOrFileModeState.mode;
-          state.state.source = folderOrFileModeState.source;
-
-          await leaf.setViewState(state);
-        }
-
-        return;
-      }
-
-      // ... get frontmatter data and search for a key indicating the desired view mode
-      // and when the given key is present ... set it to the declared mode
-      const fileCache = this.app.metadataCache.getFileCache(view.file);
-      const fileDeclaredUIMode =
-        fileCache !== null && fileCache.frontmatter
-          ? fileCache.frontmatter[this.OBSIDIAN_UI_MODE_KEY]
-          : null;
-      const fileDeclaredEditingMode =
-        fileCache !== null && fileCache.frontmatter
-          ? fileCache.frontmatter[this.OBSIDIAN_EDITING_MODE_KEY]
-          : null;
-
-
-      if (fileDeclaredUIMode) {
-        if (
-          ["source", "preview", "live"].includes(fileDeclaredUIMode) &&
-          view.getMode() !== fileDeclaredUIMode
-        ) {
-          state.state.mode = fileDeclaredUIMode;
-        }
-      }
-
-      if (fileDeclaredEditingMode) {
-        const shouldBeSourceMode = fileDeclaredEditingMode == 'source';
-        if (
-          ["source", "live"].includes(fileDeclaredEditingMode)
-        ) {
-          state.state.source = shouldBeSourceMode;
-        }
-      }
-
-      if (fileDeclaredUIMode || fileDeclaredEditingMode) {
-        await leaf.setViewState(state);
-
-        if (true == this.settings.ignoreOpenFiles) {
-          this.openedFiles = resetOpenedNotes(this.app);
-        }
-
-        return;
-      }
-
-      const defaultViewMode = this.app.vault.config.defaultViewMode
-        ? this.app.vault.config.defaultViewMode
-        : "source";
-
-      const defaultEditingModeIsLivePreview = this.app.vault.config.livePreview === undefined ? true : this.app.vault.config.livePreview;
-
-      if (!this.settings.ignoreForceViewAll) {
-        let state = leaf.getViewState();
-
-        if (view.getMode() !== defaultViewMode) {
-          state.state.mode = defaultViewMode;
-        }
-
-        state.state.source = defaultEditingModeIsLivePreview ? false : true;
-
-        await leaf.setViewState(state);
-
-        this.openedFiles = resetOpenedNotes(this.app);
-      }
-
-      return;
     };
 
-    // "active-leaf-change": open note, navigate to note -> will check whether
-    // the view mode needs to be set; default view mode setting is ignored.
+    let evaluationTimer: number | null = null;
+    const handleLeaf = (leaf: WorkspaceLeaf | null) => {
+      if (evaluationTimer !== null) {
+        window.clearTimeout(evaluationTimer);
+      }
+
+      if (this.settings.debounceTimeout === 0) {
+        void evaluateLeaf(leaf);
+        return;
+      }
+
+      evaluationTimer = window.setTimeout(() => {
+        evaluationTimer = null;
+        void evaluateLeaf(leaf);
+      }, this.settings.debounceTimeout);
+    };
+    this.register(() => {
+      if (evaluationTimer !== null) {
+        window.clearTimeout(evaluationTimer);
+      }
+    });
+
     this.registerEvent(
-      this.app.workspace.on(
-        "active-leaf-change",
-        this.settings.debounceTimeout === 0
-          ? readViewModeFromFrontmatterAndToggle
-          : debounce(
-              readViewModeFromFrontmatterAndToggle,
-              this.settings.debounceTimeout
-            )
-      )
+      this.app.workspace.on("active-leaf-change", (leaf) => handleLeaf(leaf))
+    );
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        const leaf = this.app.workspace.activeLeaf;
+        if (
+          file &&
+          leaf?.view instanceof MarkdownView &&
+          leaf.view.file?.path === file.path
+        ) {
+          handleLeaf(leaf);
+        }
+      })
     );
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loaded = (await this.loadData()) ?? {};
+    this.settings = {
+      debounceTimeout: Number.isFinite(loaded.debounceTimeout)
+        ? Math.max(0, loaded.debounceTimeout)
+        : DEFAULT_SETTINGS.debounceTimeout,
+      ignoreOpenFiles: loaded.ignoreOpenFiles === true,
+      rules: Array.isArray(loaded.rules) ? loaded.rules : [],
+    };
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
   }
-
-  async onunload() {
-    this.openedFiles = [];
-  }
 }
 
-function alreadyOpen(currFile: TFile, openedFiles: String[]): boolean {
-  const leavesWithSameNote: String[] = [];
+function createNoteFacts(file: TFile, cache: CachedMetadata | null): NoteFacts {
+  return {
+    tags: new Set(getAllTags(cache) ?? []),
+    fileName: file.name,
+    folder: file.parent?.path ?? "",
+    path: file.path,
+  };
+}
 
-  if (currFile == null) {
-    return false;
+function desiredStateFromOutput(output: ViewRuleOutput): DesiredViewState {
+  if (output.view === "reading") {
+    return { mode: "preview", source: false };
   }
 
-  openedFiles.forEach((openedFile: String) => {
-    if (openedFile == currFile.basename) {
-      leavesWithSameNote.push(openedFile);
-    }
+  return {
+    mode: "source",
+    source: output.editingMode === "source",
+  };
+}
+
+function desiredStateFromFrontmatter(
+  cache: CachedMetadata | null
+): DesiredViewState | null {
+  const frontmatter = cache?.frontmatter;
+  if (!frontmatter) {
+    return null;
+  }
+
+  const uiMode = frontmatter.obsidianUIMode;
+  const editingMode = frontmatter.obsidianEditingMode;
+  const desired: DesiredViewState = {};
+
+  if (uiMode === "preview") {
+    desired.mode = "preview";
+    desired.source = false;
+  } else if (uiMode === "source" || uiMode === "live") {
+    desired.mode = "source";
+  }
+
+  if (editingMode === "source" || editingMode === "live") {
+    desired.source = editingMode === "source";
+  }
+
+  return desired.mode !== undefined || desired.source !== undefined
+    ? desired
+    : null;
+}
+
+async function applyDesiredState(
+  leaf: WorkspaceLeaf,
+  view: MarkdownView,
+  desired: DesiredViewState
+): Promise<void> {
+  const state = leaf.getViewState();
+  const currentState = state.state ?? {};
+  const modeChanged = desired.mode !== undefined && view.getMode() !== desired.mode;
+  const sourceChanged =
+    desired.source !== undefined && currentState.source !== desired.source;
+
+  if (!modeChanged && !sourceChanged) {
+    return;
+  }
+
+  await leaf.setViewState({
+    ...state,
+    state: {
+      ...currentState,
+      ...(desired.mode !== undefined ? { mode: desired.mode } : {}),
+      ...(desired.source !== undefined ? { source: desired.source } : {}),
+    },
   });
-
-  return leavesWithSameNote.length != 0;
 }
 
-function resetOpenedNotes(app: App): String[] {
-  let openedFiles: String[] = [];
-
+function getOpenNotePaths(app: App): Set<string> {
+  const paths = new Set<string>();
   app.workspace.iterateAllLeaves((leaf) => {
-    let view = leaf.view instanceof MarkdownView ? leaf.view : null;
-
-    if (null === view) {
-      return;
+    if (leaf.view instanceof MarkdownView && leaf.view.file) {
+      paths.add(leaf.view.file.path);
     }
-
-    openedFiles.push(leaf.view?.file?.basename);
   });
-
-  return openedFiles;
+  return paths;
 }
 
-class ViewModeByFrontmatterSettingTab extends PluginSettingTab {
-  plugin: ViewModeByFrontmatterPlugin;
+class StringInputSuggest extends AbstractInputSuggest<string> {
+  constructor(
+    app: App,
+    inputEl: HTMLInputElement,
+    private readonly values: string[]
+  ) {
+    super(app, inputEl);
+  }
 
-  constructor(app: App, plugin: ViewModeByFrontmatterPlugin) {
+  protected getSuggestions(query: string): string[] {
+    const normalizedQuery = query.replace(/^#/, "").toLowerCase();
+    return this.values
+      .filter((value) => value.toLowerCase().includes(normalizedQuery))
+      .slice(0, 100);
+  }
+
+  renderSuggestion(value: string, el: HTMLElement): void {
+    el.setText(value);
+  }
+}
+
+class RuleEditorModal extends Modal {
+  private suggesters: StringInputSuggest[] = [];
+
+  constructor(
+    app: App,
+    private readonly plugin: NoteViewRulesPlugin,
+    private readonly rule: ViewRule,
+    private readonly onChanged: () => void
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.modalEl.addClass("note-view-rule-editor-modal");
+    this.render();
+  }
+
+  onClose(): void {
+    this.closeSuggesters();
+    this.contentEl.empty();
+    this.onChanged();
+  }
+
+  private render(): void {
+    this.closeSuggesters();
+    this.contentEl.empty();
+    this.setTitle(`Edit ${this.rule.name.trim() || "Untitled rule"}`);
+
+    new Setting(this.contentEl)
+      .setName("Conditions")
+      .setDesc(
+        this.rule.conditions.length === 0
+          ? "At least one condition is required."
+          : this.rule.match === "any"
+            ? "Any condition may match."
+            : "Every condition must match."
+      )
+      .setClass("note-view-rule-conditions-header")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("all", "ALL")
+          .addOption("any", "ANY")
+          .setValue(this.rule.match ?? "all")
+          .onChange(async (value) => {
+            this.rule.match = value === "any" ? "any" : "all";
+            await this.plugin.saveSettings();
+            this.render();
+          })
+      )
+      .addExtraButton((button) =>
+        button.setIcon("plus").setTooltip("Add condition").onClick(async () => {
+          this.rule.conditions.push({ id: createId("condition") });
+          await this.plugin.saveSettings();
+          this.render();
+        })
+      );
+
+    const tagSuggestions = collectVaultTags(this.app);
+    const folderSuggestions = collectVaultFolders(this.app);
+    this.rule.conditions.forEach((condition, index) => {
+      this.renderCondition(
+        condition,
+        index,
+        tagSuggestions,
+        folderSuggestions
+      );
+    });
+
+    this.renderOutput();
+  }
+
+  private renderCondition(
+    condition: ViewRuleCondition,
+    index: number,
+    tagSuggestions: string[],
+    folderSuggestions: string[]
+  ): void {
+    const conditionEl = this.contentEl.createDiv({
+      cls: "note-view-rule-condition",
+    });
+    const setting = new Setting(conditionEl);
+    setting.setClass("note-view-rule-condition-row");
+    setting.infoEl.remove();
+
+    setting.addDropdown((dropdown) => {
+      dropdown.addOption("", "Choose source…");
+      for (const [source, label] of Object.entries(SOURCE_LABELS)) {
+        dropdown.addOption(source, label);
+      }
+      dropdown.setValue(condition.source ?? "").onChange(async (value) => {
+        condition.source = value ? value as RuleSource : undefined;
+        condition.operator = undefined;
+        condition.value = undefined;
+        await this.plugin.saveSettings();
+        this.render();
+      });
+    });
+
+    if (condition.source) {
+      setting.addDropdown((dropdown) => {
+        dropdown.addOption("", "Choose operator…");
+        for (const operator of OPERATORS_BY_SOURCE[condition.source!]) {
+          dropdown.addOption(operator, OPERATOR_LABELS[operator]);
+        }
+        dropdown.setValue(condition.operator ?? "").onChange(async (value) => {
+          condition.operator = value ? value as RuleOperator : undefined;
+          condition.value = undefined;
+          await this.plugin.saveSettings();
+          this.render();
+        });
+      });
+    }
+
+    if (condition.source && condition.operator) {
+      setting.addSearch((search) => {
+        search
+          .setPlaceholder(conditionValuePlaceholder(condition.source!))
+          .setValue(condition.value ?? "")
+          .onChange(async (value) => {
+            condition.value = value;
+            await this.plugin.saveSettings();
+            this.updateConditionError(conditionEl, condition);
+          });
+
+        const suggestions = condition.source === "tag"
+          ? tagSuggestions
+          : condition.source === "folder"
+            ? folderSuggestions
+            : [];
+        if (suggestions.length > 0) {
+          const suggester = new StringInputSuggest(
+            this.app,
+            search.inputEl,
+            suggestions
+          );
+          suggester.onSelect(async (value) => {
+            search.setValue(value);
+            condition.value = value;
+            await this.plugin.saveSettings();
+            this.updateConditionError(conditionEl, condition);
+          });
+          this.suggesters.push(suggester);
+        }
+      });
+    }
+
+    setting.addExtraButton((button) =>
+      button
+        .setIcon("trash-2")
+        .setTooltip("Remove condition")
+        .onClick(async () => {
+          this.rule.conditions.splice(index, 1);
+          await this.plugin.saveSettings();
+          this.render();
+        })
+    );
+    this.updateConditionError(conditionEl, condition);
+  }
+
+  private updateConditionError(
+    conditionEl: HTMLElement,
+    condition: ViewRuleCondition
+  ): void {
+    conditionEl.querySelector(".note-view-rule-condition-error")?.remove();
+    const error = validateRule(this.rule).conditionErrors[condition.id];
+    if (error) {
+      conditionEl.createDiv({
+        cls: "note-view-rule-condition-error",
+        text: error,
+      });
+    }
+  }
+
+  private renderOutput(): void {
+    const outputSetting = new Setting(this.contentEl)
+      .setName("Open in")
+      .setDesc(outputError(this.rule));
+    outputSetting.setClass("note-view-rule-output");
+    outputSetting.addDropdown((dropdown) =>
+      dropdown
+        .addOption("", "Choose view…")
+        .addOption("reading", "Reading view")
+        .addOption("editing", "Editing view")
+        .setValue(this.rule.output?.view ?? "")
+        .onChange(async (value) => {
+          this.rule.output = value === "reading"
+            ? { view: "reading" }
+            : value === "editing"
+              ? { view: "editing" }
+              : undefined;
+          await this.plugin.saveSettings();
+          this.render();
+        })
+    );
+
+    if (this.rule.output?.view === "editing") {
+      outputSetting.addDropdown((dropdown) =>
+        dropdown
+          .addOption("", "Choose editing mode…")
+          .addOption("live", "Live Preview")
+          .addOption("source", "Source mode")
+          .setValue(this.rule.output?.editingMode ?? "")
+          .onChange(async (value) => {
+            if (this.rule.output?.view === "editing") {
+              this.rule.output.editingMode = value === "live" || value === "source"
+                ? value
+                : undefined;
+              await this.plugin.saveSettings();
+              outputSetting.setDesc(outputError(this.rule));
+            }
+          })
+      );
+    }
+  }
+
+  private closeSuggesters(): void {
+    for (const suggester of this.suggesters) {
+      suggester.close();
+    }
+    this.suggesters = [];
+  }
+}
+
+class NoteViewRulesSettingTab extends PluginSettingTab {
+  private pendingDeleteId: string | null = null;
+  private draggedRuleId: string | null = null;
+
+  constructor(app: App, private readonly plugin: NoteViewRulesPlugin) {
     super(app, plugin);
-    this.plugin = plugin;
   }
 
   display(): void {
-    let { containerEl } = this;
-
+    const { containerEl } = this;
     containerEl.empty();
-
-    const createHeader = (text: string) => containerEl.createEl("h2", { text });
-
-    const desc = document.createDocumentFragment();
-    desc.append(
-      "Changing the view mode can be done through the key ",
-      desc.createEl("code", { text: "obsidianUIMode" }),
-      ", which can have the value ",
-      desc.createEl("code", { text: "source" }),
-      " or ",
-      desc.createEl("code", { text: "preview" }),
-      ".",
-      desc.createEl("br"),
-      "Changing the editing mode happens by declaring the key ",
-      desc.createEl("code", { text: "obsidianEditingMode" }),
-      "; it takes ",
-      desc.createEl("code", { text: "live" }),
-      " or ",
-      desc.createEl("code", { text: "source" }),
-      " as value."
-    );
-
-    new Setting(this.containerEl).setDesc(desc);
+    containerEl.addClass("note-view-rules-settings");
 
     new Setting(containerEl)
-      .setName("Ignore opened files")
-      .setDesc("Never change the view mode on a note which was already open.")
-      .addToggle((checkbox) =>
-        checkbox
+      .setName("Rules")
+      .setDesc(
+        "Rules run from top to bottom. The first matching rule wins. If no rule matches, Obsidian keeps its chosen view."
+      )
+      .setHeading()
+      .addExtraButton((button) =>
+        button.setIcon("plus").setTooltip("Add rule").onClick(async () => {
+          const rule = createEmptyRule();
+          this.plugin.settings.rules.push(rule);
+          await this.plugin.saveSettings();
+          this.display();
+          this.openRuleEditor(rule);
+        })
+      );
+
+    const rulesListEl = containerEl.createDiv({ cls: "note-view-rules-list" });
+
+    if (this.plugin.settings.rules.length === 0) {
+      new Setting(rulesListEl)
+        .setName("No rules yet")
+        .setDesc("Unmatched notes are left unchanged.")
+        .setClass("note-view-rules-empty");
+    }
+
+    for (const rule of this.plugin.settings.rules) {
+      this.renderRule(rulesListEl, rule);
+    }
+
+    const advanced = containerEl.createEl("details", {
+      cls: "note-view-rules-advanced",
+    });
+    advanced.createEl("summary", { text: "Advanced" });
+
+    new Setting(advanced)
+      .setName("Ignore already-open notes")
+      .setDesc("Do not change the view of a note that is already open in a leaf.")
+      .addToggle((toggle) =>
+        toggle
           .setValue(this.plugin.settings.ignoreOpenFiles)
           .onChange(async (value) => {
             this.plugin.settings.ignoreOpenFiles = value;
             await this.plugin.saveSettings();
           })
       );
-    new Setting(containerEl)
-      .setName("Ignore force view when not in frontmatter")
-      .setDesc(
-        "Never change the view mode on a note that was opened from another one in a certain view mode"
-      )
-      .addToggle((checkbox) => {
-        checkbox
-          .setValue(this.plugin.settings.ignoreForceViewAll)
+
+    new Setting(advanced)
+      .setName("Debounce timeout")
+      .setDesc("Delay rule evaluation after opening a note, in milliseconds. Use 0 for immediate evaluation.")
+      .addText((text) =>
+        text
+          .setValue(String(this.plugin.settings.debounceTimeout))
           .onChange(async (value) => {
-            this.plugin.settings.ignoreForceViewAll = value;
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new Setting(containerEl)
-        .setName("Debounce timeout in milliseconds")
-        .setDesc(`Debounce timeout is the time in milliseconds after which the view mode is set. Set "0" to disable debouncing (default value is "300"). If you experience issues with the plugin, try increasing this value.`)
-        .addText((cb) => {
-            cb.setValue(String(this.plugin.settings.debounceTimeout)).onChange(async (value) => {
-                this.plugin.settings.debounceTimeout = Number(value);
-
-                await this.plugin.saveSettings();
-            });
-        });
-
-    const modes = [
-      "default",
-      "obsidianUIMode: preview",
-      "obsidianUIMode: source",
-      "obsidianEditingMode: live",
-      "obsidianEditingMode: source",
-    ]
-
-    createHeader("Folders")
-
-    const folderDesc = document.createDocumentFragment();
-    folderDesc.append(
-        "Specify a view mode for notes in a given folder.",
-        folderDesc.createEl("br"),
-        "Note that this will force the view mode on all the notes in the folder, even if they have a different view mode set in their frontmatter.",
-        folderDesc.createEl("br"),
-        "Precedence is from bottom (highest) to top (lowest), so if you have child folders specified, make sure to put them below their parent folder."
-    );
-
-    new Setting(this.containerEl).setDesc(folderDesc);
-
-    new Setting(this.containerEl)
-      .setDesc("Add new folder")
-      .addButton((button) => {
-        button
-          .setTooltip("Add another folder to the list")
-          .setButtonText("+")
-          .setCta()
-          .onClick(async () => {
-            this.plugin.settings.folders.push({
-              folder: "",
-              viewMode: "",
-            });
-            await this.plugin.saveSettings();
-            this.display();
-          });
-      });
-
-
-    this.plugin.settings.folders.forEach(
-      (folderMode, index) => {
-        const div = containerEl.createEl("div");
-        div.addClass("force-view-mode-div")
-        div.addClass("force-view-mode-folder")
-
-        const s = new Setting(this.containerEl)
-          .addSearch((cb) => {
-            cb.setPlaceholder("Example: folder1/templates")
-              .setValue(folderMode.folder)
-              .onChange(async (newFolder) => {
-                if (
-                  newFolder &&
-                  this.plugin.settings.folders.some(
-                    (e) => e.folder == newFolder
-                  )
-                ) {
-                  console.error("ForceViewMode: This folder already has a template associated with", newFolder);
-
-                  return;
-                }
-
-                this.plugin.settings.folders[
-                  index
-                ].folder = newFolder;
-
-                await this.plugin.saveSettings();
-              });
-          })
-          .addDropdown(cb => {
-            modes.forEach(mode => {
-              cb.addOption(mode, mode);
-            });
-
-            cb.setValue(folderMode.viewMode || "default")
-              .onChange(async (value) => {
-                this.plugin.settings.folders[
-                  index
-                ].viewMode = value;
-
-                await this.plugin.saveSettings();
-              });
-          })
-          .addExtraButton((cb) => {
-            cb.setIcon("cross")
-              .setTooltip("Delete")
-              .onClick(async () => {
-                this.plugin.settings.folders.splice(
-                  index,
-                  1
-                );
-
-                await this.plugin.saveSettings();
-                
-                this.display();
-              });
-          });
-        
-        s.infoEl.remove();
-
-        div.appendChild(containerEl.lastChild as Node);
-      }
-    );
- 
-    createHeader("Files");
-
-    const filesDesc = document.createDocumentFragment();
-    filesDesc.append(
-      "Specify a view mode for notes with specific patterns (regular expression; example \" - All$\" for all notes ending with \" - All\" or \"1900-01\" for all daily notes starting with \"1900-01\"",
-      filesDesc.createEl("br"),
-      "Note that this will force the view mode, even if it have a different view mode set in its frontmatter.",
-      filesDesc.createEl("br"),
-      "Precedence is from bottom (highest) to top (lowest).",
-      filesDesc.createEl("br"),
-      "Notice that configuring a file pattern will override the folder configuration for the same file."
-    );
-
-    new Setting(this.containerEl).setDesc(filesDesc);
-
-    new Setting(this.containerEl)
-      .setDesc("Add new file")
-      .addButton((button) => {
-        button
-          .setTooltip("Add another file to the list")
-          .setButtonText("+")
-          .setCta()
-          .onClick(async () => {
-            this.plugin.settings.files.push({
-              filePattern: "",
-              viewMode: "",
-            });
-            await this.plugin.saveSettings();
-            this.display();
-          });
-      });
-
-    this.plugin.settings.files.forEach((file, index) => {
-      const div = containerEl.createEl("div");
-      div.addClass("force-view-mode-div");
-      div.addClass("force-view-mode-folder");
-
-      const s = new Setting(this.containerEl)
-        .addSearch((cb) => {
-          cb.setPlaceholder(`Example: " - All$" or "1900-01")`)
-            .setValue(file.filePattern)
-            .onChange(async (value) => {
-              if (
-                value &&
-                this.plugin.settings.files.some((e) => e.filePattern == value)
-              ) {
-                console.error("ForceViewMode: Pattern already exists", value);
-
-                return;
-              }
-
-              this.plugin.settings.files[index].filePattern = value;
-
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed >= 0) {
+              this.plugin.settings.debounceTimeout = parsed;
               await this.plugin.saveSettings();
-            });
-        })
-        .addDropdown((cb) => {
-          modes.forEach((mode) => {
-            cb.addOption(mode, mode);
-          });
+            }
+          })
+      );
+  }
 
-          cb.setValue(file.viewMode || "default").onChange(async (value) => {
-            this.plugin.settings.files[index].viewMode = value;
+  private renderRule(
+    containerEl: HTMLElement,
+    rule: ViewRule
+  ): void {
+    const validation = validateRule(rule);
+    const ruleEl = containerEl.createDiv({ cls: "note-view-rule" });
+    ruleEl.toggleClass("is-disabled", !rule.enabled);
+    this.attachDropTarget(ruleEl, rule.id);
 
-            await this.plugin.saveSettings();
-          });
-        })
-        .addExtraButton((cb) => {
-          cb.setIcon("cross")
-            .setTooltip("Delete")
-            .onClick(async () => {
-              this.plugin.settings.files.splice(index, 1);
+    const header = new Setting(ruleEl)
+      .setName(rule.name.trim() || "Untitled rule")
+      .setDesc(ruleSummary(rule, validation));
+    header.setClass("note-view-rule-header");
+    this.makeRuleNameEditable(header, rule);
 
-              await this.plugin.saveSettings();
-
-              this.display();
-            });
-        });
-
-      s.infoEl.remove();
-
-      div.appendChild(containerEl.lastChild as Node);
+    header.addExtraButton((button) => {
+      button.setIcon("grip-vertical").setTooltip("Drag to reorder");
+      const handle = button.extraSettingsEl;
+      handle.setAttr("draggable", "true");
+      handle.addClass("note-view-rule-grip");
+      header.settingEl.insertBefore(handle, header.infoEl);
+      handle.addEventListener("dragstart", (event) => {
+        this.draggedRuleId = rule.id;
+        event.dataTransfer?.setData("text/plain", rule.id);
+        event.dataTransfer?.setDragImage(header.settingEl, 16, 16);
+        ruleEl.addClass("is-dragging");
+      });
+      handle.addEventListener("dragend", () => {
+        this.draggedRuleId = null;
+        ruleEl.removeClass("is-dragging");
+      });
     });
+    header.addToggle((toggle) =>
+      toggle.setValue(rule.enabled).onChange(async (value) => {
+        rule.enabled = value;
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    header.addExtraButton((button) =>
+      button.setIcon("copy").setTooltip("Duplicate rule").onClick(async () => {
+        const copy = duplicateRule(rule);
+        const index = this.plugin.settings.rules.indexOf(rule);
+        this.plugin.settings.rules.splice(index + 1, 0, copy);
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+
+    if (this.pendingDeleteId === rule.id) {
+      header.addExtraButton((button) =>
+        button.setIcon("check").setTooltip("Confirm delete").onClick(async () => {
+          this.plugin.settings.rules = this.plugin.settings.rules.filter(
+            (candidate) => candidate.id !== rule.id
+          );
+          this.pendingDeleteId = null;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+      header.addExtraButton((button) =>
+        button.setIcon("x").setTooltip("Cancel delete").onClick(() => {
+          this.pendingDeleteId = null;
+          this.display();
+        })
+      );
+    } else {
+      header.addExtraButton((button) =>
+        button.setIcon("trash-2").setTooltip("Delete rule").onClick(() => {
+          this.pendingDeleteId = rule.id;
+          this.display();
+        })
+      );
+    }
+
+    header.addExtraButton((button) =>
+      button
+        .setIcon("pencil")
+        .setTooltip("Edit rule")
+        .onClick(() => this.openRuleEditor(rule))
+    );
+  }
+
+  private openRuleEditor(rule: ViewRule): void {
+    new RuleEditorModal(
+      this.app,
+      this.plugin,
+      rule,
+      () => this.display()
+    ).open();
+  }
+
+  private attachDropTarget(ruleEl: HTMLElement, targetRuleId: string): void {
+    ruleEl.addEventListener("dragover", (event) => {
+      if (this.draggedRuleId && this.draggedRuleId !== targetRuleId) {
+        event.preventDefault();
+        ruleEl.addClass("is-drag-over");
+      }
+    });
+    ruleEl.addEventListener("dragleave", () => ruleEl.removeClass("is-drag-over"));
+    ruleEl.addEventListener("drop", async (event) => {
+      event.preventDefault();
+      ruleEl.removeClass("is-drag-over");
+      const sourceId = this.draggedRuleId ?? event.dataTransfer?.getData("text/plain");
+      if (!sourceId || sourceId === targetRuleId) {
+        return;
+      }
+
+      const sourceIndex = this.plugin.settings.rules.findIndex(
+        (rule) => rule.id === sourceId
+      );
+      const targetIndex = this.plugin.settings.rules.findIndex(
+        (rule) => rule.id === targetRuleId
+      );
+      if (sourceIndex < 0 || targetIndex < 0) {
+        return;
+      }
+
+      const insertAfter = event.clientY > ruleEl.getBoundingClientRect().top + ruleEl.clientHeight / 2;
+      const [moved] = this.plugin.settings.rules.splice(sourceIndex, 1);
+      let insertionIndex = this.plugin.settings.rules.findIndex(
+        (rule) => rule.id === targetRuleId
+      );
+      if (insertAfter) {
+        insertionIndex += 1;
+      }
+      this.plugin.settings.rules.splice(insertionIndex, 0, moved);
+      this.draggedRuleId = null;
+      await this.plugin.saveSettings();
+      this.display();
+    });
+  }
+
+  private makeRuleNameEditable(header: Setting, rule: ViewRule): void {
+    const nameEl = header.nameEl;
+    nameEl.setAttr("tabindex", "0");
+    nameEl.setAttr("title", "Click to rename");
+
+    const startEditing = () => {
+      nameEl.setAttr("contenteditable", "true");
+      nameEl.focus();
+      const selection = window.getSelection();
+      selection?.selectAllChildren(nameEl);
+      selection?.collapseToEnd();
+    };
+
+    nameEl.addEventListener("click", startEditing);
+    nameEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        nameEl.blur();
+      } else if (event.key === "Escape") {
+        nameEl.setText(rule.name.trim() || "Untitled rule");
+        nameEl.removeAttribute("contenteditable");
+        nameEl.blur();
+      }
+    });
+    nameEl.addEventListener("blur", async () => {
+      if (nameEl.getAttribute("contenteditable") !== "true") {
+        return;
+      }
+      const value = nameEl.innerText.trim() || "Untitled rule";
+      nameEl.removeAttribute("contenteditable");
+      nameEl.setText(value);
+      rule.name = value;
+      await this.plugin.saveSettings();
+    });
+  }
+}
+
+function createEmptyRule(): ViewRule {
+  return {
+    id: createId("rule"),
+    name: "Untitled rule",
+    enabled: true,
+    match: "all",
+    conditions: [],
+  };
+}
+
+function duplicateRule(rule: ViewRule): ViewRule {
+  return {
+    ...rule,
+    id: createId("rule"),
+    name: `${rule.name || "Untitled rule"} copy`,
+    match: rule.match ?? "all",
+    conditions: rule.conditions.map((condition) => ({
+      ...condition,
+      id: createId("condition"),
+    })),
+    output: rule.output ? { ...rule.output } : undefined,
+  };
+}
+
+function createId(prefix: string): string {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function collectVaultTags(app: App): string[] {
+  const tags = new Set<string>();
+  for (const file of app.vault.getMarkdownFiles()) {
+    for (const tag of getAllTags(app.metadataCache.getFileCache(file)) ?? []) {
+      tags.add(tag.replace(/^#/, ""));
+    }
+  }
+  return Array.from(tags).sort((a, b) => a.localeCompare(b));
+}
+
+function collectVaultFolders(app: App): string[] {
+  return app.vault
+    .getAllLoadedFiles()
+    .filter((file): file is TFolder => file instanceof TFolder && file.path !== "/")
+    .map((folder) => folder.path)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function ruleSummary(
+  rule: ViewRule,
+  validation: ReturnType<typeof validateRule>
+): string {
+  const count = rule.conditions.length;
+  const conditionSummary = `${count} condition${count === 1 ? "" : "s"}`;
+  const outputSummary = outputLabel(rule.output);
+  return validation.valid
+    ? `${conditionSummary} · ${outputSummary}`
+    : `${conditionSummary} · Needs configuration`;
+}
+
+function outputLabel(output?: ViewRuleOutput): string {
+  if (!output) {
+    return "No view selected";
+  }
+  if (output.view === "reading") {
+    return "Reading view";
+  }
+  return output.editingMode === "source"
+    ? "Editing · Source mode"
+    : output.editingMode === "live"
+      ? "Editing · Live Preview"
+      : "Editing · Choose mode";
+}
+
+function outputError(rule: ViewRule): string {
+  return validateRule(rule).ruleErrors.find((error) =>
+    error === "Choose a view" || error === "Choose an editing mode"
+  ) ?? "";
+}
+
+function conditionValuePlaceholder(source: RuleSource): string {
+  switch (source) {
+    case "tag":
+      return "Select or enter a tag";
+    case "folder":
+      return "Select or enter a folder";
+    case "fileName":
+      return "Example: Index.md";
+    case "path":
+      return "Example: 40 Chronology/2026/Index.md";
   }
 }
